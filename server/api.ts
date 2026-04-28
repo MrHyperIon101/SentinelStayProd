@@ -50,7 +50,7 @@ This is a simulated ${title} incident. The automated systems have detected anoma
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
     const prompt = `You are an AI assistant for an emergency response command center.
 Please summarize the following incident context.
 Your response MUST contain exactly three sections:

@@ -2,14 +2,52 @@ import React, { useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAppStore } from '../../store/appStore';
 import { severityLabel, severityColor, statusColor, roleColor, formatElapsed } from '../../utils/formatting';
+import IncidentAISummary from '../../components/IncidentAISummary';
 
 const FILTER_LABELS = { all: 'All', active: 'Active', acknowledged: 'Acknowledged' } as const;
 
+type EmptyStateProps = {
+  isLoading: boolean;
+  totalIncidents: number;
+  onStartDrill: () => void;
+};
+
+function EmptyIncidentsState({ isLoading, totalIncidents, onStartDrill }: EmptyStateProps) {
+  if (isLoading) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-on-surface-variant py-6 justify-center">
+        <span className="material-symbols-outlined animate-spin text-base">autorenew</span>
+        Loading incidents…
+      </div>
+    );
+  }
+  return (
+    <div className="bg-surface-container-low rounded-xl p-5 border border-dashed border-outline-variant/30 text-center">
+      <span className="material-symbols-outlined text-3xl text-emerald-500 mb-2" style={{ fontVariationSettings: "'FILL' 1" }}>
+        check_circle
+      </span>
+      <p className="text-sm font-semibold text-on-surface mb-1">No active incidents</p>
+      <p className="text-[11px] text-on-surface-variant leading-relaxed mb-3">
+        {totalIncidents === 0
+          ? 'No incidents have been reported. If you expect to see data, verify your role permissions in Supabase or seed your database.'
+          : 'All reported incidents have been resolved.'}
+      </p>
+      <button
+        onClick={onStartDrill}
+        className="bg-amber-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold hover:opacity-90 transition-opacity inline-flex items-center gap-1.5"
+      >
+        <span className="material-symbols-outlined text-sm">play_circle</span>
+        Run Drill
+      </button>
+    </div>
+  );
+}
+
 export default function StaffDashboard() {
   const {
-    incidents, staff, alerts, guests,
+    incidents, staff, alerts, guests, isLoading,
     acknowledgeAlert, respondToIncident, escalateIncident, resolveIncident,
-    elapsedSeconds,
+    startDrill, elapsedSeconds,
   } = useAppStore();
 
   const [filter, setFilter] = useState<'all' | 'active' | 'acknowledged'>('all');
@@ -115,6 +153,47 @@ export default function StaffDashboard() {
               <span className="text-2xl font-bold text-on-surface">{stat.value}</span>
             </div>
           ))}
+        </div>
+
+        {/* Active Incidents (visible on smaller screens where the sidebar is hidden) */}
+        <div className="lg:hidden mb-5">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-xs font-bold text-on-surface-variant uppercase tracking-widest flex items-center gap-2">
+              <span className="material-symbols-outlined text-base text-tertiary">crisis_alert</span>
+              Active Incidents ({activeIncidents.length})
+            </h2>
+          </div>
+          <div className="space-y-3">
+            {activeIncidents.map((inc) => (
+              <div key={`mob-${inc.id}`} className="bg-surface-container-low rounded-xl p-4 border border-outline-variant/10">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${severityColor(inc.severity)}`}>
+                    {inc.severity === 4 ? 'CRITICAL' : inc.severity === 3 ? 'HIGH' : 'MEDIUM'}
+                  </span>
+                  <span className="text-[10px] font-mono text-on-surface-variant">{inc.id}</span>
+                  <span className={`ml-auto text-[10px] px-2 py-0.5 rounded-full font-semibold capitalize ${inc.status === 'active' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>
+                    {inc.status}
+                  </span>
+                </div>
+                <h3 className="text-sm font-bold text-on-surface mb-1">{inc.title}</h3>
+                <p className="text-xs text-on-surface-variant flex items-center gap-1">
+                  <span className="material-symbols-outlined text-xs">location_on</span>
+                  {inc.location.building}, Floor {inc.location.floor}{inc.location.room ? `, Room ${inc.location.room}` : ''}
+                </p>
+                <IncidentAISummary
+                  incident={inc}
+                  missingGuests={guests.filter((g) => g.status === 'missing' && g.floor === inc.location.floor).length}
+                />
+              </div>
+            ))}
+            {activeIncidents.length === 0 && (
+              <EmptyIncidentsState
+                isLoading={isLoading}
+                totalIncidents={incidents.length}
+                onStartDrill={() => { startDrill(); addToast('Drill incident created.', 'bg-amber-500'); }}
+              />
+            )}
+          </div>
         </div>
 
         {/* Search + Filters */}
@@ -278,12 +357,12 @@ export default function StaffDashboard() {
       </div>
 
       {/* Right Sidebar */}
-      <aside className="w-[340px] h-full bg-surface-container-lowest border-l border-outline-variant/10 flex flex-col overflow-hidden shrink-0 hidden xl:flex">
+      <aside className="w-[340px] h-full bg-surface-container-lowest border-l border-outline-variant/10 flex-col overflow-hidden shrink-0 hidden lg:flex">
         {/* Active Incidents */}
         <div className="flex-1 overflow-y-auto p-5">
           <h2 className="text-xs font-bold text-on-surface-variant uppercase tracking-widest mb-4 flex items-center gap-2">
             <span className="material-symbols-outlined text-base text-tertiary">crisis_alert</span>
-            Active Incidents
+            Active Incidents ({activeIncidents.length})
           </h2>
           <div className="space-y-3">
             {activeIncidents.map((inc) => (
@@ -298,6 +377,7 @@ export default function StaffDashboard() {
                 <p className="text-xs text-on-surface-variant flex items-center gap-1">
                   <span className="material-symbols-outlined text-xs">location_on</span>
                   {inc.location.building}, Floor {inc.location.floor}
+                  {inc.location.room ? `, Room ${inc.location.room}` : ''}
                 </p>
                 <div className="flex items-center gap-2 mt-3">
                   <span className="text-xs text-on-surface-variant flex items-center gap-1">
@@ -308,8 +388,20 @@ export default function StaffDashboard() {
                     {inc.status}
                   </span>
                 </div>
+                <IncidentAISummary
+                  incident={inc}
+                  missingGuests={guests.filter((g) => g.status === 'missing' && g.floor === inc.location.floor).length}
+                />
               </div>
             ))}
+
+            {activeIncidents.length === 0 && (
+              <EmptyIncidentsState
+                isLoading={isLoading}
+                totalIncidents={incidents.length}
+                onStartDrill={() => { startDrill(); addToast('Drill incident created.', 'bg-amber-500'); }}
+              />
+            )}
           </div>
 
           {/* Staff Roster */}

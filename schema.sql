@@ -260,6 +260,95 @@ CREATE POLICY alerts_update     ON public.alerts FOR UPDATE TO authenticated
   USING (public.current_role() IN ('staff','responder','dispatcher','admin'))
   WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
 
+-- =============================================================================
+-- Auto-create an incident row whenever a guest SOS alert arrives.
+-- Runs as the table owner so it bypasses RLS — guests can only INSERT alerts
+-- (type='sos') per the policy above, and this trigger turns that into an
+-- incident the staff dashboard / IncidentLog page can render in real time.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION public.handle_new_sos_alert()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_incident_id    text;
+  v_building       text := 'Tower A';
+  v_floor          integer := 1;
+  v_room           text := '0';
+  v_type           public.incident_type := 'other';
+  v_lower_msg      text := lower(coalesce(NEW.message, ''));
+  v_loc_match      text[];
+BEGIN
+  -- Only act on guest-initiated SOS alerts that aren't already linked.
+  IF NEW.type <> 'sos' OR NEW.incident_id IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+
+  -- Best-effort parse of "<building>, Floor <n>, Room <r>" from alerts.location.
+  v_loc_match := regexp_match(coalesce(NEW.location, ''), '^([^,]+),\s*Floor\s+(\d+)(?:,\s*Room\s+([\w-]+))?', 'i');
+  IF v_loc_match IS NOT NULL THEN
+    v_building := trim(v_loc_match[1]);
+    v_floor    := coalesce(v_loc_match[2]::int, 1);
+    v_room     := coalesce(v_loc_match[3], '0');
+  END IF;
+
+  -- Best-effort category classification from the alert message.
+  IF v_lower_msg LIKE '%fire%' OR v_lower_msg LIKE '%smoke%' THEN
+    v_type := 'fire';
+  ELSIF v_lower_msg LIKE '%medical%' OR v_lower_msg LIKE '%injur%' OR v_lower_msg LIKE '%health%' THEN
+    v_type := 'medical';
+  ELSIF v_lower_msg LIKE '%security%' OR v_lower_msg LIKE '%threat%' OR v_lower_msg LIKE '%intrud%' THEN
+    v_type := 'security';
+  END IF;
+
+  v_incident_id := 'SOS-' || upper(substr(replace(NEW.id::text, '-', ''), 1, 10));
+
+  INSERT INTO public.incidents (
+    id, title, type, severity, status,
+    location_building, location_floor, location_room,
+    location_x, location_y,
+    reported_at, reported_by, description,
+    assigned_units, casualties, evacuated, guests_affected
+  ) VALUES (
+    v_incident_id,
+    'Guest SOS — ' || initcap(v_type::text),
+    v_type,
+    greatest(1, least(4, coalesce(NEW.severity, 3))),
+    'active',
+    v_building, v_floor, v_room,
+    0, 0,
+    now(), 'Guest Portal',
+    'Guest-initiated SOS: ' || coalesce(NEW.message, '(no message)'),
+    ARRAY[]::text[], 0, 0, 1
+  )
+  ON CONFLICT (id) DO NOTHING;
+
+  -- Link the alert back to the incident.
+  NEW.incident_id := v_incident_id;
+
+  -- Seed the timeline.
+  INSERT INTO public.timeline_events (id, incident_id, timestamp, message, type, author)
+  VALUES (
+    gen_random_uuid(),
+    v_incident_id,
+    to_char(now(), 'HH24:MI:SS'),
+    coalesce(NEW.message, 'Guest SOS received.'),
+    'alert',
+    'Guest Portal'
+  );
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_alerts_sos_to_incident ON public.alerts;
+CREATE TRIGGER trg_alerts_sos_to_incident
+  BEFORE INSERT ON public.alerts
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_new_sos_alert();
+
 -- Realtime publication --------------------------------------------------------
 BEGIN;
   DROP PUBLICATION IF EXISTS supabase_realtime;

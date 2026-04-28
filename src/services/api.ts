@@ -170,4 +170,46 @@ export const api = {
       acknowledged: false
     });
   },
+
+  /**
+   * Creates a guest-initiated SOS by inserting only the alerts row.
+   * A `BEFORE INSERT` trigger (`handle_new_sos_alert` in schema.sql) creates
+   * the linked incident + timeline event server-side, bypassing RLS so guests
+   * who can only INSERT alerts still produce a full incident record visible
+   * in the Staff Dashboard and Incident Log.
+   */
+  async createSOSAlert(input: {
+    category: 'medical' | 'fire' | 'security' | 'other';
+    room: string;
+    floor: number;
+    building: string;
+    silent?: boolean;
+    guestName?: string;
+  }) {
+    const now = new Date();
+    const timeStr = now.toTimeString().slice(0, 8);
+    const severityMap = { medical: 3, fire: 4, security: 3, other: 2 } as const;
+    const alertId = crypto.randomUUID();
+
+    const { data, error } = await supabase
+      .from('alerts')
+      .insert({
+        id: alertId,
+        type: 'sos',
+        severity: severityMap[input.category],
+        message: `SOS: ${input.category} emergency in Room ${input.room}${input.silent ? ' (silent mode)' : ''}`,
+        location: `${input.building}, Floor ${input.floor}, Room ${input.room}`,
+        timestamp: timeStr,
+        acknowledged: false,
+      })
+      .select('id, incident_id')
+      .single();
+
+    if (error) {
+      console.error('SOS alert insert failed:', error.message);
+      throw new Error(error.message);
+    }
+
+    return { alertId: data.id, incidentId: data.incident_id ?? null };
+  },
 };
