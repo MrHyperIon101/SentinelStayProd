@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS public.profiles (
 );
 
 -- Helper: stable, security-definer accessor for the current user's role.
+-- COALESCE so that an authenticated user without a profiles row (e.g. existing
+-- auth users created before the on_auth_user_created trigger was installed)
+-- still passes staff-tier RLS checks. Without this, every write silently
+-- fails with "new row violates row-level security policy".
 CREATE OR REPLACE FUNCTION public.current_role()
 RETURNS app_role
 LANGUAGE sql
@@ -60,7 +64,10 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT role FROM public.profiles WHERE id = auth.uid()
+  SELECT COALESCE(
+    (SELECT role FROM public.profiles WHERE id = auth.uid()),
+    'staff'::app_role
+  )
 $$;
 
 -- Auto-provision a profile row when a new auth user is created.
@@ -82,6 +89,14 @@ DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created
 AFTER INSERT ON auth.users
 FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- Backfill: ensure every existing auth user has a profile row (idempotent).
+-- Without this, users created before the trigger existed return NULL from
+-- current_role() and fail every RLS write check.
+INSERT INTO public.profiles (id, email, full_name)
+SELECT u.id, u.email, COALESCE(u.raw_user_meta_data->>'full_name', NULL)
+FROM auth.users u
+WHERE NOT EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = u.id);
 
 -- Domain tables ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.incidents (
@@ -235,10 +250,10 @@ CREATE POLICY timeline_read   ON public.timeline_events FOR SELECT TO authentica
 CREATE POLICY timeline_insert ON public.timeline_events FOR INSERT TO authenticated
   WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
 
--- staff: read by authenticated, write by dispatcher/admin
+-- staff: read by authenticated, write by staff+ (so command center can add units)
 CREATE POLICY staff_read   ON public.staff FOR SELECT TO authenticated USING (true);
 CREATE POLICY staff_write  ON public.staff FOR INSERT TO authenticated
-  WITH CHECK (public.current_role() IN ('dispatcher','admin'));
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
 CREATE POLICY staff_update ON public.staff FOR UPDATE TO authenticated
   USING (public.current_role() IN ('staff','responder','dispatcher','admin'))
   WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
@@ -253,7 +268,12 @@ CREATE POLICY guests_update ON public.guests FOR UPDATE TO authenticated
 
 -- alerts: read by authenticated, anonymous SOS allowed, ack by staff+
 CREATE POLICY alerts_read       ON public.alerts FOR SELECT TO authenticated USING (true);
+-- Anonymous guests on the public SOS portal can only insert SOS alerts.
 CREATE POLICY alerts_anon_sos   ON public.alerts FOR INSERT TO anon WITH CHECK (type = 'sos');
+-- Any authenticated user (including role='guest') can also raise an SOS for
+-- themselves — staff+ may additionally raise non-SOS alerts.
+CREATE POLICY alerts_auth_sos   ON public.alerts FOR INSERT TO authenticated
+  WITH CHECK (type = 'sos');
 CREATE POLICY alerts_auth_write ON public.alerts FOR INSERT TO authenticated
   WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
 CREATE POLICY alerts_update     ON public.alerts FOR UPDATE TO authenticated

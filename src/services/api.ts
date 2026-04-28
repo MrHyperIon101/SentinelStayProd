@@ -100,16 +100,47 @@ export const api = {
   },
 
   async updateIncidentStatus(id: string, status: Incident['status']) {
-    await supabase.from('incidents').update({ status }).eq('id', id);
+    const { error: updErr } = await supabase.from('incidents').update({ status }).eq('id', id);
+    if (updErr) throw new Error(updErr.message);
+    const now = new Date();
+    const tlType: TimelineEvent['type'] =
+      status === 'resolved' ? 'resolution' :
+      status === 'responding' ? 'dispatch' :
+      'update';
+    const message =
+      status === 'resolved' ? 'Incident marked as resolved.' :
+      status === 'responding' ? 'Units responding to scene.' :
+      status === 'contained' ? 'Incident contained.' :
+      'Status updated to active.';
+    const { error: tlErr } = await supabase.from('timeline_events').insert({
+      id: crypto.randomUUID(),
+      incident_id: id,
+      timestamp: now.toTimeString().slice(0, 8),
+      message,
+      type: tlType,
+      author: 'Command Center',
+    });
+    if (tlErr) throw new Error(tlErr.message);
   },
 
   async escalateIncident(id: string, currentSeverity: number) {
     const nextSeverity = Math.min(4, currentSeverity + 1);
-    await supabase.from('incidents').update({ severity: nextSeverity }).eq('id', id);
+    const { error: updErr } = await supabase.from('incidents').update({ severity: nextSeverity }).eq('id', id);
+    if (updErr) throw new Error(updErr.message);
+    const now = new Date();
+    const { error: tlErr } = await supabase.from('timeline_events').insert({
+      id: crypto.randomUUID(),
+      incident_id: id,
+      timestamp: now.toTimeString().slice(0, 8),
+      message: `Incident escalated to severity ${nextSeverity}.`,
+      type: 'escalation',
+      author: 'Command Center',
+    });
+    if (tlErr) throw new Error(tlErr.message);
   },
 
   async addTimelineEvent(incidentId: string, event: Omit<TimelineEvent, 'id'>) {
-    await supabase.from('timeline_events').insert({
+    const { error } = await supabase.from('timeline_events').insert({
       id: crypto.randomUUID(),
       incident_id: incidentId,
       timestamp: event.timestamp,
@@ -117,10 +148,134 @@ export const api = {
       type: event.type,
       author: event.author,
     });
+    if (error) throw new Error(error.message);
   },
 
   async acknowledgeAlert(id: string) {
-    await supabase.from('alerts').update({ acknowledged: true }).eq('id', id);
+    const { error } = await supabase.from('alerts').update({ acknowledged: true }).eq('id', id);
+    if (error) throw new Error(error.message);
+  },
+
+  /**
+   * Insert a new staff member (dispatcher/admin/staff per RLS).
+   */
+  async createStaff(input: {
+    name: string;
+    role: StaffMember['role'];
+    unit?: string;
+    building?: string;
+    floor?: number;
+    phone?: string;
+  }) {
+    const id = `U-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+    const unit = input.unit?.trim() || `Unit ${id.slice(2, 5)}`;
+    const row = {
+      id,
+      name: input.name,
+      role: input.role,
+      unit,
+      status: 'available' as StaffMember['status'],
+      location_building: input.building || 'Tower A',
+      location_floor: input.floor ?? 1,
+      location_x: 100,
+      location_y: 100,
+      phone: input.phone || null,
+      avatar: null,
+      current_incident: null,
+      eta: null,
+    };
+    const { data, error } = await supabase.from('staff').insert(row).select('*').single();
+    if (error) throw new Error(error.message);
+    return mapStaff(data);
+  },
+
+  /**
+   * Deploy a staff member to an incident:
+   *  - sets staff.current_incident + status to 'en-route' (or 'deployed')
+   *  - appends the unit to incidents.assigned_units
+   *  - inserts a 'dispatch' timeline event
+   */
+  async deployStaff(staffId: string, incidentId: string, opts?: { eta?: string; onScene?: boolean }) {
+    const status: StaffMember['status'] = opts?.onScene ? 'deployed' : 'en-route';
+    const eta = opts?.eta || (opts?.onScene ? 'On Scene' : 'ETA 2m');
+
+    const { data: staffRow, error: sErr } = await supabase
+      .from('staff')
+      .update({ current_incident: incidentId, status, eta })
+      .eq('id', staffId)
+      .select('*')
+      .single();
+    if (sErr) throw new Error(sErr.message);
+
+    const { data: incRow } = await supabase
+      .from('incidents')
+      .select('assigned_units')
+      .eq('id', incidentId)
+      .single();
+    const existing: string[] = (incRow?.assigned_units || []) as string[];
+    const unitName = staffRow.unit;
+    if (unitName && !existing.includes(unitName)) {
+      await supabase.from('incidents')
+        .update({ assigned_units: [...existing, unitName] })
+        .eq('id', incidentId);
+    }
+
+    const now = new Date();
+    await supabase.from('timeline_events').insert({
+      id: crypto.randomUUID(),
+      incident_id: incidentId,
+      timestamp: now.toTimeString().slice(0, 8),
+      message: `${staffRow.unit} (${staffRow.name}) dispatched — ${eta}.`,
+      type: 'dispatch',
+      author: 'Command Center',
+    });
+
+    return mapStaff(staffRow);
+  },
+
+  /**
+   * Recall a staff member from any incident: status -> available, clear linkage.
+   */
+  async recallStaff(staffId: string) {
+    const { data: prev } = await supabase
+      .from('staff')
+      .select('current_incident, unit, name')
+      .eq('id', staffId)
+      .single();
+
+    const { data, error } = await supabase
+      .from('staff')
+      .update({ current_incident: null, status: 'available', eta: null })
+      .eq('id', staffId)
+      .select('*')
+      .single();
+    if (error) throw new Error(error.message);
+
+    if (prev?.current_incident) {
+      const { data: incRow } = await supabase
+        .from('incidents')
+        .select('assigned_units')
+        .eq('id', prev.current_incident)
+        .single();
+      const existing: string[] = (incRow?.assigned_units || []) as string[];
+      const next = existing.filter((u) => u !== prev.unit);
+      if (next.length !== existing.length) {
+        await supabase.from('incidents')
+          .update({ assigned_units: next })
+          .eq('id', prev.current_incident);
+      }
+      const now = new Date();
+      await supabase.from('timeline_events').insert({
+        id: crypto.randomUUID(),
+        incident_id: prev.current_incident,
+        timestamp: now.toTimeString().slice(0, 8),
+        message: `${prev.unit} (${prev.name}) recalled to standby.`,
+        type: 'update',
+        author: 'Command Center',
+      });
+    }
+
+    return mapStaff(data);
   },
 
   async createDrillIncident() {

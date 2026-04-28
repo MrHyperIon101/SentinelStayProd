@@ -1,10 +1,16 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { chatMessages } from '../../data/mockData';
 
 export default function GuestChat() {
-  const [messages, setMessages] = useState(chatMessages);
+  const [messages, setMessages] = useState<Array<{ id: string; sender: 'guest' | 'staff' | 'ai'; text: string; timestamp: string }>>([
+    {
+      id: 'sys-welcome',
+      sender: 'ai',
+      text: "Hi, I'm your SentinelStay assistant. Tell me what's happening and I'll route you to the right team. Reply STOP to end this chat.",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    },
+  ]);
   const [input, setInput] = useState('');
   const [typing, setTyping] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
