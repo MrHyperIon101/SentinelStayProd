@@ -21,6 +21,7 @@ const CommandCenter = lazy(() => import('./pages/command/CommandCenter'));
 const IncidentLog = lazy(() => import('./pages/command/IncidentLog'));
 const GuestRoster = lazy(() => import('./pages/command/GuestRoster'));
 const BuildingData = lazy(() => import('./pages/command/BuildingData'));
+const Channels = lazy(() => import('./pages/command/Channels'));
 const ResponderPortal = lazy(() => import('./pages/responder/ResponderPortal'));
 const CorporateDashboard = lazy(() => import('./pages/corporate/CorporateDashboard'));
 const AnalyticsDashboard = lazy(() => import('./pages/analytics/AnalyticsDashboard'));
@@ -69,6 +70,7 @@ function App() {
           <Route path="/command/incidents" element={<IncidentLog />} />
           <Route path="/command/guests" element={<GuestRoster />} />
           <Route path="/command/building" element={<BuildingData />} />
+          <Route path="/command/channels" element={<Channels />} />
           <Route path="/profile" element={<Profile />} />
           <Route path="/settings" element={<Settings />} />
         </Route>

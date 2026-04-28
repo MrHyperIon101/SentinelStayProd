@@ -367,4 +367,125 @@ export const api = {
 
     return { alertId: data.id, incidentId: data.incident_id ?? null };
   },
+
+  // ---------------------------------------------------------------------------
+  // Chat / Channels — guest <-> staff realtime messaging.
+  // A `channel` is just a string key, e.g. "Tower A::1402". Anyone can read,
+  // anon may only insert as sender='guest', staff may post anything.
+  // ---------------------------------------------------------------------------
+
+  channelKey(building: string, room: string) {
+    return `${building.trim()}::${room.trim()}`;
+  },
+
+  async fetchMessages(channel: string) {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('channel', channel)
+      .order('created_at', { ascending: true })
+      .limit(500);
+    if (error) throw new Error(error.message);
+    return (data || []) as ChatMessageRow[];
+  },
+
+  async fetchChannels() {
+    // Returns a unique channel list with last message + count for the staff panel.
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(2000);
+    if (error) throw new Error(error.message);
+    const map = new Map<string, { channel: string; lastMessage: ChatMessageRow; count: number }>();
+    for (const row of (data || []) as ChatMessageRow[]) {
+      const existing = map.get(row.channel);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        map.set(row.channel, { channel: row.channel, lastMessage: row, count: 1 });
+      }
+    }
+    return Array.from(map.values());
+  },
+
+  async sendMessage(input: {
+    channel: string;
+    sender: 'guest' | 'staff' | 'ai' | 'system';
+    senderName?: string;
+    body?: string;
+    attachmentUrl?: string;
+    attachmentType?: 'image' | 'audio' | 'location';
+    lat?: number;
+    lng?: number;
+  }) {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({
+        channel: input.channel,
+        sender: input.sender,
+        sender_name: input.senderName ?? null,
+        body: input.body ?? null,
+        attachment_url: input.attachmentUrl ?? null,
+        attachment_type: input.attachmentType ?? null,
+        lat: input.lat ?? null,
+        lng: input.lng ?? null,
+      })
+      .select('*')
+      .single();
+    if (error) throw new Error(error.message);
+    return data as ChatMessageRow;
+  },
+
+  subscribeMessages(channel: string, onInsert: (row: ChatMessageRow) => void) {
+    const sub = supabase
+      .channel(`messages:${channel}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel=eq.${channel}` },
+        (payload) => onInsert(payload.new as ChatMessageRow),
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(sub);
+    };
+  },
+
+  subscribeAllMessages(onInsert: (row: ChatMessageRow) => void) {
+    const sub = supabase
+      .channel('messages:all')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'messages' },
+        (payload) => onInsert(payload.new as ChatMessageRow),
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(sub);
+    };
+  },
+
+  async uploadAttachment(file: Blob, opts: { channel: string; kind: 'image' | 'audio'; ext: string }) {
+    const safeChannel = opts.channel.replace(/[^a-z0-9._-]/gi, '_');
+    const path = `${safeChannel}/${opts.kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${opts.ext}`;
+    const { error } = await supabase.storage
+      .from('chat-attachments')
+      .upload(path, file, { contentType: file.type || undefined, upsert: false });
+    if (error) throw new Error(error.message);
+    const { data } = supabase.storage.from('chat-attachments').getPublicUrl(path);
+    return data.publicUrl;
+  },
 };
+
+export interface ChatMessageRow {
+  id: string;
+  channel: string;
+  sender: 'guest' | 'staff' | 'ai' | 'system';
+  sender_name: string | null;
+  body: string | null;
+  attachment_url: string | null;
+  attachment_type: 'image' | 'audio' | 'location' | null;
+  lat: number | null;
+  lng: number | null;
+  created_at: string;
+}
