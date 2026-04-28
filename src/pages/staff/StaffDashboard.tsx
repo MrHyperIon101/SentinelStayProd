@@ -1,4 +1,5 @@
 import React, { useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAppStore } from '../../store/appStore';
 import { severityLabel, severityColor, statusColor, roleColor, formatElapsed } from '../../utils/formatting';
@@ -47,7 +48,7 @@ export default function StaffDashboard() {
   const {
     incidents, staff, alerts, guests, isLoading,
     acknowledgeAlert, respondToIncident, escalateIncident, resolveIncident,
-    startDrill, elapsedSeconds,
+    startDrill, elapsedSeconds, updateStaffStatus,
   } = useAppStore();
 
   const [filter, setFilter] = useState<'all' | 'active' | 'acknowledged'>('all');
@@ -97,6 +98,37 @@ export default function StaffDashboard() {
     addToast(`${incidentId} marked resolved.`, 'bg-emerald-600');
   };
 
+  const myUnitOnDuty = (myUnit?.status ?? 'off-duty') !== 'off-duty';
+
+  const handleToggleDuty = () => {
+    if (!myUnit) {
+      addToast('No staff record linked to this account.', 'bg-amber-500');
+      return;
+    }
+    const next: typeof myUnit.status = myUnitOnDuty ? 'off-duty' : 'available';
+    updateStaffStatus(myUnit.id, next);
+    addToast(
+      next === 'off-duty' ? 'You are now off duty.' : 'You are back on duty.',
+      next === 'off-duty' ? 'bg-slate-600' : 'bg-emerald-600',
+    );
+  };
+
+  const handleStaffSOS = async () => {
+    if (!myUnit) {
+      addToast('No staff record linked to this account.', 'bg-amber-500');
+      return;
+    }
+    const note = window.prompt('Optional details for backup request (e.g. "hostile guest, floor 14"):', '');
+    if (note === null) return; // cancelled
+    try {
+      const { api } = await import('../../services/api');
+      await api.raiseStaffSOS({ staff: myUnit, note: note || undefined });
+      addToast('Staff SOS broadcast sent.', 'bg-tertiary');
+    } catch (e: any) {
+      addToast(`SOS failed: ${e?.message || 'unknown error'}`, 'bg-red-600');
+    }
+  };
+
   return (
     <div className="h-full flex overflow-hidden relative">
       {/* Toast Container */}
@@ -126,11 +158,31 @@ export default function StaffDashboard() {
             <p className="text-sm text-on-surface-variant mt-0.5">Alert Management & Response Operations</p>
           </div>
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-full">
-              <span className={`w-2 h-2 rounded-full ${statusColor('available')}`} />
-              <span className="text-xs font-semibold text-emerald-700">On Duty — {myUnit?.name}</span>
-            </div>
-            <button className="bg-tertiary text-on-tertiary px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2 shadow-md hover:opacity-90 transition-opacity">
+            <button
+              onClick={handleToggleDuty}
+              className={`flex items-center gap-2 border px-3 py-1.5 rounded-full transition-colors ${
+                myUnitOnDuty
+                  ? 'bg-emerald-500/15 border-emerald-400/40 hover:bg-emerald-500/25'
+                  : 'bg-slate-700/40 border-slate-500/40 hover:bg-slate-700/60'
+              }`}
+              title={myUnit ? 'Click to toggle on/off duty' : 'No staff record linked'}
+            >
+              <span className={`w-2 h-2 rounded-full ${myUnitOnDuty ? 'bg-emerald-400 animate-pulse' : 'bg-slate-400'}`} />
+              <span className={`text-xs font-semibold ${myUnitOnDuty ? 'text-emerald-300' : 'text-slate-300'}`}>
+                {myUnitOnDuty ? 'On Duty' : 'Off Duty'}{myUnit ? ` — ${myUnit.name}` : ''}
+              </span>
+            </button>
+            <Link
+              to="/command/channels"
+              className="bg-primary text-on-primary px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2 shadow-md hover:opacity-90 transition-opacity"
+            >
+              <span className="material-symbols-outlined text-base" style={{ fontVariationSettings: "'FILL' 1" }}>forum</span>
+              Channels
+            </Link>
+            <button
+              onClick={handleStaffSOS}
+              className="bg-tertiary text-on-tertiary px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2 shadow-md hover:opacity-90 transition-opacity active:scale-95"
+            >
               <span className="material-symbols-outlined text-base" style={{ fontVariationSettings: "'FILL' 1" }}>sos</span>
               Staff SOS
             </button>
@@ -140,17 +192,17 @@ export default function StaffDashboard() {
         {/* Stats Cards */}
         <div className="grid grid-cols-4 gap-3 mb-5">
           {[
-            { label: 'Active Incidents', value: activeIncidents.length, icon: 'crisis_alert', color: 'text-tertiary', bg: 'bg-red-50' },
-            { label: 'Unacknowledged', value: alerts.filter((a) => !a.acknowledged).length, icon: 'notifications_active', color: 'text-amber-600', bg: 'bg-amber-50' },
-            { label: 'Staff On Duty', value: staff.filter((s) => s.status !== 'off-duty').length, icon: 'groups', color: 'text-primary', bg: 'bg-blue-50' },
-            { label: 'Elapsed', value: formatElapsed(elapsedSeconds), icon: 'timer', color: 'text-on-surface-variant', bg: 'bg-surface-container' },
+            { label: 'Active Incidents', value: activeIncidents.length, icon: 'crisis_alert', color: 'text-red-300',     bg: 'bg-red-500/10 border-red-500/20' },
+            { label: 'Unacknowledged',   value: alerts.filter((a) => !a.acknowledged).length, icon: 'notifications_active', color: 'text-amber-300', bg: 'bg-amber-500/10 border-amber-500/20' },
+            { label: 'Staff On Duty',    value: staff.filter((s) => s.status !== 'off-duty').length, icon: 'groups', color: 'text-blue-300',    bg: 'bg-blue-500/10 border-blue-500/20' },
+            { label: 'Elapsed',          value: formatElapsed(elapsedSeconds), icon: 'timer', color: 'text-slate-300',  bg: 'bg-slate-700/40 border-slate-600/40' },
           ].map((stat) => (
-            <div key={stat.label} className={`${stat.bg} rounded-xl p-4 border border-outline-variant/10 shadow-sm`}>
+            <div key={stat.label} className={`${stat.bg} rounded-xl p-4 border shadow-sm`}>
               <div className="flex items-center gap-2 mb-2">
                 <span className={`material-symbols-outlined text-lg ${stat.color}`}>{stat.icon}</span>
-                <span className="text-[10px] text-on-surface-variant uppercase tracking-widest font-medium">{stat.label}</span>
+                <span className="text-[10px] text-slate-400 uppercase tracking-widest font-medium">{stat.label}</span>
               </div>
-              <span className="text-2xl font-bold text-on-surface">{stat.value}</span>
+              <span className="text-2xl font-bold text-white">{stat.value}</span>
             </div>
           ))}
         </div>

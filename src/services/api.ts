@@ -156,6 +156,34 @@ export const api = {
     if (error) throw new Error(error.message);
   },
 
+  async updateStaffStatus(id: string, status: StaffMember['status']) {
+    const { error } = await supabase.from('staff').update({ status }).eq('id', id);
+    if (error) throw new Error(error.message);
+  },
+
+  async raiseStaffSOS(input: { staff: StaffMember; note?: string }) {
+    const { staff, note } = input;
+    const now = new Date();
+    const timeStr = now.toTimeString().slice(0, 8);
+    const message = `STAFF SOS: ${staff.name} (${staff.unit}) requesting backup${note ? ` — ${note}` : ''}`;
+    const location = `${staff.location.building}, Floor ${staff.location.floor}`;
+    const { data, error } = await supabase
+      .from('alerts')
+      .insert({
+        id: crypto.randomUUID(),
+        type: 'staff',
+        severity: 3,
+        message,
+        location,
+        timestamp: timeStr,
+        acknowledged: false,
+      })
+      .select('*')
+      .single();
+    if (error) throw new Error(error.message);
+    return data;
+  },
+
   /**
    * Insert a new staff member (dispatcher/admin/staff per RLS).
    */

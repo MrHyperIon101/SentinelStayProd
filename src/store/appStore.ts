@@ -227,9 +227,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   updateStaffStatus: (staffId, status) => {
+    const prev = get().staff.find((s) => s.id === staffId);
     set((state) => ({
       staff: state.staff.map((s) => (s.id === staffId ? { ...s, status } : s)),
     }));
+    api.updateStaffStatus(staffId, status).catch((e) => {
+      console.error('updateStaffStatus failed:', e);
+      if (prev) {
+        set((state) => ({
+          staff: state.staff.map((s) => (s.id === staffId ? { ...s, status: prev.status } : s)),
+        }));
+      }
+      alert(`Could not update status: ${(e as Error).message}`);
+    });
   },
 
   addStaff: async (input) => {
