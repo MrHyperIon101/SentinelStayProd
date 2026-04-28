@@ -1,0 +1,278 @@
+-- =============================================================================
+-- SentinelStay database schema
+-- Run this whole file in the Supabase SQL editor for a fresh project.
+-- It is idempotent enough for repeated runs in dev (drops are guarded).
+-- =============================================================================
+
+-- Extensions ------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Enums (guarded) -------------------------------------------------------------
+DO $$ BEGIN
+  CREATE TYPE incident_type AS ENUM ('fire', 'medical', 'security', 'hazmat', 'weather', 'other');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE incident_status AS ENUM ('active', 'responding', 'contained', 'resolved');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE timeline_event_type AS ENUM ('alert', 'dispatch', 'update', 'escalation', 'resolution');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE alert_type AS ENUM ('sos', 'sensor', 'staff', 'system');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE staff_role AS ENUM ('security', 'maintenance', 'medical', 'management', 'housekeeping', 'engineering');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE staff_status AS ENUM ('available', 'deployed', 'en-route', 'off-duty', 'break');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE guest_status AS ENUM ('in-room', 'common-area', 'evacuated', 'missing', 'checked-out');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE app_role AS ENUM ('guest', 'staff', 'responder', 'dispatcher', 'admin');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Profiles & roles ------------------------------------------------------------
+-- Every authenticated user gets a row in public.profiles. RLS policies below
+-- key off `role` to grant the right level of access.
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email       TEXT,
+  full_name   TEXT,
+  role        app_role NOT NULL DEFAULT 'staff',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Helper: stable, security-definer accessor for the current user's role.
+CREATE OR REPLACE FUNCTION public.current_role()
+RETURNS app_role
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT role FROM public.profiles WHERE id = auth.uid()
+$$;
+
+-- Auto-provision a profile row when a new auth user is created.
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, email, full_name)
+  VALUES (NEW.id, NEW.email, COALESCE(NEW.raw_user_meta_data->>'full_name', NULL))
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- Domain tables ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.incidents (
+  id                 TEXT PRIMARY KEY,
+  title              TEXT NOT NULL,
+  type               incident_type NOT NULL,
+  severity           INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 4),
+  status             incident_status NOT NULL,
+  location_building  TEXT NOT NULL,
+  location_floor     INTEGER NOT NULL,
+  location_room      TEXT NOT NULL,
+  location_x         FLOAT NOT NULL,
+  location_y         FLOAT NOT NULL,
+  reported_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reported_by        TEXT NOT NULL,
+  description        TEXT NOT NULL,
+  assigned_units     TEXT[] NOT NULL DEFAULT '{}',
+  casualties         INTEGER NOT NULL DEFAULT 0,
+  evacuated          INTEGER NOT NULL DEFAULT 0,
+  guests_affected    INTEGER NOT NULL DEFAULT 0,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.timeline_events (
+  id           TEXT PRIMARY KEY,
+  incident_id  TEXT NOT NULL REFERENCES public.incidents(id) ON DELETE CASCADE,
+  timestamp    TEXT NOT NULL,
+  message      TEXT NOT NULL,
+  type         timeline_event_type NOT NULL,
+  author       TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.staff (
+  id                TEXT PRIMARY KEY,
+  name              TEXT NOT NULL,
+  role              staff_role NOT NULL,
+  unit              TEXT NOT NULL,
+  status            staff_status NOT NULL,
+  location_building TEXT NOT NULL,
+  location_floor    INTEGER NOT NULL,
+  location_x        FLOAT NOT NULL,
+  location_y        FLOAT NOT NULL,
+  phone             TEXT,
+  avatar            TEXT,
+  current_incident  TEXT REFERENCES public.incidents(id) ON DELETE SET NULL,
+  eta               TEXT,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.guests (
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL,
+  room            TEXT NOT NULL,
+  building        TEXT NOT NULL,
+  floor           INTEGER NOT NULL,
+  check_in        TEXT,
+  check_out       TEXT,
+  status          guest_status NOT NULL,
+  accessibility   TEXT[] NOT NULL DEFAULT '{}',
+  language        TEXT NOT NULL,
+  vip             BOOLEAN NOT NULL DEFAULT FALSE,
+  last_seen       TEXT,
+  phone           TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.alerts (
+  id            TEXT PRIMARY KEY,
+  type          alert_type NOT NULL,
+  severity      INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 4),
+  message       TEXT NOT NULL,
+  location      TEXT NOT NULL,
+  timestamp     TEXT NOT NULL,
+  acknowledged  BOOLEAN NOT NULL DEFAULT FALSE,
+  incident_id   TEXT REFERENCES public.incidents(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Useful indexes
+CREATE INDEX IF NOT EXISTS idx_incidents_status     ON public.incidents (status);
+CREATE INDEX IF NOT EXISTS idx_incidents_reported   ON public.incidents (reported_at DESC);
+CREATE INDEX IF NOT EXISTS idx_timeline_incident    ON public.timeline_events (incident_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_ack           ON public.alerts (acknowledged, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_staff_status         ON public.staff (status);
+
+-- updated_at triggers ---------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.touch_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END $$;
+
+DROP TRIGGER IF EXISTS trg_incidents_touch ON public.incidents;
+CREATE TRIGGER trg_incidents_touch BEFORE UPDATE ON public.incidents
+FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_staff_touch ON public.staff;
+CREATE TRIGGER trg_staff_touch BEFORE UPDATE ON public.staff
+FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_guests_touch ON public.guests;
+CREATE TRIGGER trg_guests_touch BEFORE UPDATE ON public.guests
+FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_profiles_touch ON public.profiles;
+CREATE TRIGGER trg_profiles_touch BEFORE UPDATE ON public.profiles
+FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+-- Row Level Security ----------------------------------------------------------
+ALTER TABLE public.profiles        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.incidents       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.timeline_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.guests          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.alerts          ENABLE ROW LEVEL SECURITY;
+
+-- Drop any prior policies (idempotent re-run support)
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT schemaname, tablename, policyname FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename IN ('profiles','incidents','timeline_events','staff','guests','alerts')
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', r.policyname, r.schemaname, r.tablename);
+  END LOOP;
+END $$;
+
+-- profiles: users can read/update only their own row; admins can read/update all
+CREATE POLICY profiles_self_read   ON public.profiles FOR SELECT TO authenticated
+  USING (id = auth.uid() OR public.current_role() = 'admin');
+CREATE POLICY profiles_self_update ON public.profiles FOR UPDATE TO authenticated
+  USING (id = auth.uid() OR public.current_role() = 'admin')
+  WITH CHECK (id = auth.uid() OR public.current_role() = 'admin');
+
+-- incidents: any authenticated user can read; only staff+ can write
+CREATE POLICY incidents_read  ON public.incidents FOR SELECT TO authenticated USING (true);
+CREATE POLICY incidents_write ON public.incidents FOR INSERT TO authenticated
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+CREATE POLICY incidents_update ON public.incidents FOR UPDATE TO authenticated
+  USING (public.current_role() IN ('staff','responder','dispatcher','admin'))
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+CREATE POLICY incidents_delete ON public.incidents FOR DELETE TO authenticated
+  USING (public.current_role() IN ('dispatcher','admin'));
+
+-- timeline_events: read by authenticated, insert by staff+
+CREATE POLICY timeline_read   ON public.timeline_events FOR SELECT TO authenticated USING (true);
+CREATE POLICY timeline_insert ON public.timeline_events FOR INSERT TO authenticated
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+
+-- staff: read by authenticated, write by dispatcher/admin
+CREATE POLICY staff_read   ON public.staff FOR SELECT TO authenticated USING (true);
+CREATE POLICY staff_write  ON public.staff FOR INSERT TO authenticated
+  WITH CHECK (public.current_role() IN ('dispatcher','admin'));
+CREATE POLICY staff_update ON public.staff FOR UPDATE TO authenticated
+  USING (public.current_role() IN ('staff','responder','dispatcher','admin'))
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+
+-- guests: read by authenticated, write by staff+
+CREATE POLICY guests_read   ON public.guests FOR SELECT TO authenticated USING (true);
+CREATE POLICY guests_write  ON public.guests FOR INSERT TO authenticated
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+CREATE POLICY guests_update ON public.guests FOR UPDATE TO authenticated
+  USING (public.current_role() IN ('staff','responder','dispatcher','admin'))
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+
+-- alerts: read by authenticated, anonymous SOS allowed, ack by staff+
+CREATE POLICY alerts_read       ON public.alerts FOR SELECT TO authenticated USING (true);
+CREATE POLICY alerts_anon_sos   ON public.alerts FOR INSERT TO anon WITH CHECK (type = 'sos');
+CREATE POLICY alerts_auth_write ON public.alerts FOR INSERT TO authenticated
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+CREATE POLICY alerts_update     ON public.alerts FOR UPDATE TO authenticated
+  USING (public.current_role() IN ('staff','responder','dispatcher','admin'))
+  WITH CHECK (public.current_role() IN ('staff','responder','dispatcher','admin'));
+
+-- Realtime publication --------------------------------------------------------
+BEGIN;
+  DROP PUBLICATION IF EXISTS supabase_realtime;
+  CREATE PUBLICATION supabase_realtime;
+COMMIT;
+
+ALTER PUBLICATION supabase_realtime ADD TABLE public.incidents;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.timeline_events;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.alerts;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.staff;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.guests;
+
+-- =============================================================================
+-- Bootstrap: promote your own user to admin once you've signed up.
+--   UPDATE public.profiles SET role = 'admin' WHERE email = 'you@example.com';
+-- =============================================================================
