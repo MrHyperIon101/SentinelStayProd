@@ -142,18 +142,28 @@ export default function GuestChat() {
     if (recording) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mr = new MediaRecorder(stream);
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4;codecs=mp4a.40.2',
+        'audio/mp4',
+      ];
+      const supported = candidates.find((t) =>
+        typeof MediaRecorder !== 'undefined' && (MediaRecorder as any).isTypeSupported?.(t),
+      );
+      const mr = supported ? new MediaRecorder(stream, { mimeType: supported }) : new MediaRecorder(stream);
       audioChunksRef.current = [];
       mr.ondataavailable = (ev) => {
         if (ev.data.size > 0) audioChunksRef.current.push(ev.data);
       };
       mr.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(audioChunksRef.current, { type: mr.mimeType || 'audio/webm' });
+        const mime = mr.mimeType || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: mime });
         if (blob.size === 0) return;
         setUploading('audio');
         try {
-          const ext = (mr.mimeType || 'audio/webm').includes('mp4') ? 'm4a' : 'webm';
+          const ext = mime.includes('mp4') ? 'm4a' : 'webm';
           const url = await api.uploadAttachment(blob, { channel, kind: 'audio', ext });
           await send({
             channel,
@@ -252,7 +262,22 @@ export default function GuestChat() {
                       </a>
                     )}
                     {msg.attachment_type === 'audio' && msg.attachment_url && (
-                      <audio controls src={msg.attachment_url} className="w-full max-w-[260px] mb-1" />
+                      <div className="mb-1">
+                        <audio
+                          controls
+                          preload="metadata"
+                          src={msg.attachment_url}
+                          className="w-full max-w-[260px] block"
+                        />
+                        <a
+                          href={msg.attachment_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[11px] underline opacity-80"
+                        >
+                          Open audio
+                        </a>
+                      </div>
                     )}
                     {msg.attachment_type === 'location' && msg.lat != null && msg.lng != null && (
                       <a
